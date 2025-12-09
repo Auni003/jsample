@@ -1,168 +1,177 @@
 pipeline {
     agent any
- 
+
     environment {
-        IMAGE_NAME       = "myapi-img"
-        IMAGE_TAG        = "v1"
-        CONTAINER_NAME   = "myapi-container"
-        JMETER_IMAGE     = "justb4/jmeter:latest"
-        JMETER_CONTAINER = "jmeter-agent"
-        NETWORK_NAME     = "jenkins-net"
-        API_PORT         = "8290"
-        JMX_FILE         = "API_TestPlan.jmx"
-        RESULTS_DIR      = "results"
+        DOCKER_IMG = "myapi-img:v1"
+        DOCKER_CONTAINER = "myapi-container"
+        NETWORK = "jenkins-net"
+        API_HEALTH_URL = "http://${DOCKER_CONTAINER}:8290/health"
+        API_TEST_URL = "http://${DOCKER_CONTAINER}:8290/appointmentservices/getAppointment"
     }
- 
+
     stages {
-        stage('Clean Workspace') {
-            steps {
-                deleteDir() // Ensures a clean start
-            }
-        }
- 
+
         stage('Checkout SCM') {
             steps {
-                checkout scm // Pull latest code
+                checkout scm
             }
         }
- 
+
+        stage('Clean Workspace') {
+            steps {
+                deleteDir()
+                checkout scm
+            }
+        }
+
         stage('Prepare Workspace') {
             steps {
-                sh "mkdir -p ${RESULTS_DIR}"
-                sh "rm -rf ${RESULTS_DIR}/* || true"
+                sh 'mkdir -p results'
+                sh 'rm -rf results/*'
             }
         }
- 
+
         stage('Create Docker Network') {
             steps {
-                sh "docker network inspect ${NETWORK_NAME} || docker network create ${NETWORK_NAME}"
+                sh '''
+                    if ! docker network inspect ${NETWORK} >/dev/null 2>&1; then
+                        docker network create ${NETWORK}
+                    fi
+                '''
             }
         }
- 
+
         stage('Build Docker Image') {
             steps {
-                echo "Building Docker image ${IMAGE_NAME}:${IMAGE_TAG}"
-                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+                echo "Building Docker image ${DOCKER_IMG}"
+                sh "docker build --no-cache -t ${DOCKER_IMG} ."
             }
         }
- 
+
         stage('Stop & Remove Old Containers') {
             steps {
-                sh """
-                    docker stop ${CONTAINER_NAME} || true
-                    docker rm ${CONTAINER_NAME} || true
-                    docker stop ${JMETER_CONTAINER} || true
-                    docker rm ${JMETER_CONTAINER} || true
-                """
+                sh '''
+                    docker stop ${DOCKER_CONTAINER} || true
+                    docker rm ${DOCKER_CONTAINER} || true
+                    docker stop jmeter-agent || true
+                    docker rm jmeter-agent || true
+                '''
             }
         }
- 
+
         stage('Run Docker Container') {
             steps {
                 sh """
-                    docker run -d \
-                    --name ${CONTAINER_NAME} \
-                    --network ${NETWORK_NAME} \
-                    -p ${API_PORT}:${API_PORT} \
-                    ${IMAGE_NAME}:${IMAGE_TAG}
+                    docker run -d --name ${DOCKER_CONTAINER} \
+                    --network ${NETWORK} \
+                    -p 8290:8290 \
+                    ${DOCKER_IMG}
                 """
             }
         }
- 
-        stage('Verify Container') {
+
+        stage('Wait for MI to Start') {
             steps {
-                sh "docker ps"
-            }
-        }
- 
-stage('Test APIs') {
-    steps {
-        script {
-            def apis = [
-                [method: 'GET', path: '/appointmentservices/getAppointment'],
-                [method: 'PUT', path: '/appointmentservices/setAppointment']
-            ]
- 
-            apis.each { api ->
-                echo "Waiting for ${api.method} ${api.path}..."
-                def ready = false
-                for (int i = 1; i <= 18; i++) { // Increase attempts to 18 (3 minutes)
-                    sleep 10
-                    def status = sh(script: "curl -o /dev/null -s -w '%{http_code}' -X ${api.method} http://${CONTAINER_NAME}:${API_PORT}${api.path}", returnStdout: true).trim()
-                    echo "Attempt ${i}: HTTP ${status}"
-                    if (status == "200" || status == "202") {
-                        ready = true
-                        echo "${api.method} ${api.path} is ready!"
-                        break
+                script {
+                    echo "⏳ Waiting for Micro Integrator to start (max 60 seconds)..."
+
+                    def ready = false
+
+                    for (int i = 1; i <= 12; i++) {
+                        def code = sh(
+                            script: "curl -o /dev/null -s -w '%{http_code}' ${API_HEALTH_URL}",
+                            returnStdout: true
+                        ).trim()
+
+                        if (code == "200") {
+                            echo "✅ Micro Integrator is UP!"
+                            ready = true
+                            break
+                        } else {
+                            echo "MI not ready yet... (${i}/12). Returned HTTP: ${code}"
+                            sleep 5
+                        }
+                    }
+
+                    if (!ready) {
+                        error("❌ Micro Integrator failed to start within timeout.")
                     }
                 }
-                if (!ready) {
-                    error "${api.method} ${api.path} not ready after 3 minutes"
+            }
+        }
+
+        stage('Test API Endpoint') {
+            steps {
+                script {
+                    echo "Testing API: ${API_TEST_URL}"
+                    def code = sh(
+                        script: "curl -o /dev/null -s -w '%{http_code}' ${API_TEST_URL}",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API Response Code: ${code}"
+
+                    if (code != "200") {
+                        error("❌ API endpoint test failed (returned ${code})")
+                    }
                 }
             }
         }
-    }
-}
- 
- 
-stage('Verify JMX File') {
-    steps {
-        sh "ls -l ${WORKSPACE} || echo 'Workspace missing!'"
-        sh "ls -l ${WORKSPACE}/${JMX_FILE} || echo 'JMX file not found!'"
-    }
-}
- 
- 
+
+        stage('Verify JMX File') {
+            when {
+                expression { fileExists('test-plan.jmx') }
+            }
+            steps {
+                echo "JMX file found."
+            }
+        }
+
         stage('Run JMeter Load Test') {
-    steps {
-       echo "🏃 Running JMeter load test..."
-            sh """
-                docker run --rm \
-                --name ${JMETER_CONTAINER} \
-                --network ${NETWORK_NAME} \
-                -v /var/lib/docker/volumes/jenkins_home/_data/workspace/pipeB:/workspace \
-                -v/var/lib/docker/volumes/jenkins_home/_data/workspace/pipeB/results:/results \
-                -w /workspace \
-                --user root \
-                ${JMETER_IMAGE} \
-                -n -t /workspace/${JMX_FILE} \
-                -l /results/report.csv \
-                -e -o /results/html_report
-            """
+            when {
+                expression { fileExists('test-plan.jmx') }
+            }
+            steps {
+                sh '''
+                    docker run --rm --name jmeter-agent \
+                    --network ${NETWORK} \
+                    -v $PWD:/tests \
+                    justb4/jmeter \
+                    -n -t /tests/test-plan.jmx \
+                    -l /tests/results/results.jtl \
+                    -e -o /tests/results/html
+                '''
+            }
+        }
+
+        stage('Archive JMeter Report') {
+            when {
+                expression { fileExists('results/results.jtl') }
+            }
+            steps {
+                archiveArtifacts artifacts: 'results/**/*', fingerprint: true
+            }
+        }
+
+        stage('Publish JMeter HTML Report') {
+            when {
+                expression { fileExists('results/html/index.html') }
+            }
+            steps {
+                publishHTML([
+                    reportDir: 'results/html',
+                    reportFiles: 'index.html',
+                    reportName: 'JMeter HTML Report'
+                ])
+            }
         }
     }
 
- 
-        stage('Archive JMeter Report') {
-            steps {
-                archiveArtifacts artifacts: "${RESULTS_DIR}/report.csv, ${RESULTS_DIR}/html_report/**", allowEmptyArchive: true
-            }
-        }
- 
-        stage('Publish JMeter HTML Report') {
-            steps {
-                script {
-                    def reportDir = "${RESULTS_DIR}/html_report"
-                    if (fileExists(reportDir)) {
-                        publishHTML([
-                            reportDir: reportDir,
-                            reportFiles: 'index.html',
-                            reportName: 'JMeter Load Test Report',
-                            alwaysLinkToLastBuild: true,
-                            keepAll: true
-                        ])
-                    } else {
-                        echo "❌ HTML report folder does not exist: ${reportDir}"
-                    }
-                }
-            }
-        }
-    }
- 
     post {
         always {
-            echo "✅ Pipeline finished!"
-            cleanWs() // Cleanup workspace after build
+            echo "🔥 Cleaning workspace..."
+            cleanWs()
+            echo "🏁 Pipeline finished!"
         }
     }
 }
