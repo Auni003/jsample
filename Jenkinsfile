@@ -7,6 +7,7 @@ pipeline {
         CONTAINER_NAME   = "myapi-container"
         NETWORK_NAME     = "jenkins-net"
         API_PORT         = "8290"
+        RESULTS_DIR      = "results"
     }
  
     stages {
